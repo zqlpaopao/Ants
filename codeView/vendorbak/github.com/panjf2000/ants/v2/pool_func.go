@@ -30,18 +30,17 @@ import (
 	"github.com/panjf2000/ants/v2/internal"
 )
 
-// Pool accepts the tasks from client, it limits the total of goroutines to a given number by recycling goroutines.
-type Pool struct {
-	// capacity of the pool, a negative value means that the capacity of pool is limitless, an infinite pool is used to
-	// avoid potential issue of endless blocking caused by nested usage of a pool: submitting a task to pool
-	// which submits a new task to the same pool.
+// PoolWithFunc accepts the tasks from client,
+// it limits the total of goroutines to a given number by recycling goroutines.
+type PoolWithFunc struct {
+	// capacity of the pool.
 	capacity int32
 
 	// running is the number of the currently running goroutines.
 	running int32
 
 	// workers is a slice that store the available workers.
-	workers workerArray
+	workers []*goWorkerWithFunc
 
 	// state is used to notice the pool to closed itself.
 	state int32
@@ -51,6 +50,9 @@ type Pool struct {
 
 	// cond for waiting to get a idle worker.
 	cond *sync.Cond
+
+	// poolFunc is the function for processing tasks.
+	poolFunc func(interface{})
 
 	// workerCache speeds up the obtainment of the an usable worker in function:retrieveWorker.
 	workerCache sync.Pool
@@ -62,64 +64,61 @@ type Pool struct {
 }
 
 // purgePeriodically clears expired workers periodically which runs in an individual goroutine, as a scavenger.
-/**
-* 定期清除过期的工人，作为清道夫定期清除在单独的goroutine中运行的工人。
-*/
-func (p *Pool) purgePeriodically() {
+func (p *PoolWithFunc) purgePeriodically() {
 	heartbeat := time.NewTicker(p.options.ExpiryDuration)
 	defer heartbeat.Stop()
-	//fmt.Printf("%#v",p.state)
-	//os.Exit(12)
 
+	var expiredWorkers []*goWorkerWithFunc
 	for range heartbeat.C {
-		//原子读取当前值是多少，pool是否关闭
 		if atomic.LoadInt32(&p.state) == CLOSED {
 			break
 		}
-
+		currentTime := time.Now()
 		p.lock.Lock()
-		expiredWorkers := p.workers.retrieveExpiry(p.options.ExpiryDuration)
+		idleWorkers := p.workers
+		n := len(idleWorkers)
+		var i int
+		for i = 0; i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.options.ExpiryDuration; i++ {
+		}
+		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
+		if i > 0 {
+			m := copy(idleWorkers, idleWorkers[i:])
+			for i = m; i < n; i++ {
+				idleWorkers[i] = nil
+			}
+			p.workers = idleWorkers[:m]
+		}
 		p.lock.Unlock()
 
 		// Notify obsolete workers to stop.
 		// This notification must be outside the p.lock, since w.task
 		// may be blocking and may consume a lot of time if many workers
 		// are located on non-local CPUs.
-		/**
-		* 通知被淘汰的工人停止。
-		* 这个通知必须在p.s.锁之外，因为w.t task
-		* 可能是阻塞和可能消耗很多时间，如果许多工人
-		* 位于非本地cpu上。
-		*/
-		for i := range expiredWorkers {
-			expiredWorkers[i].task <- nil
+		for i, w := range expiredWorkers {
+			w.args <- nil
 			expiredWorkers[i] = nil
 		}
 
 		// There might be a situation that all workers have been cleaned up(no any worker is running)
 		// while some invokers still get stuck in "p.cond.Wait()",
 		// then it ought to wakes all those invokers.
-		/**
-		* 可能存在这样一种情况，即所有工人都已清理干净(没有任何工人在运行)
-		* 当一些调用者仍然被“p.cond.Wait()”所困时，
-		* 然后它会唤醒所有的调用者。
-		*/
 		if p.Running() == 0 {
 			p.cond.Broadcast()
 		}
 	}
 }
 
-// NewPool generates an instance of ants pool.
-/**
-* NewPool生成一个ants pool的实例。
-*/
-func NewPool(size int, options ...Option) (*Pool, error) {
-	opts := loadOptions(options...)
-
+// NewPoolWithFunc generates an instance of ants pool with a specific function.
+func NewPoolWithFunc(size int, pf func(interface{}), options ...Option) (*PoolWithFunc, error) {
 	if size <= 0 {
-		size = -1
+		return nil, ErrInvalidPoolSize
 	}
+
+	if pf == nil {
+		return nil, ErrLackPoolFunc
+	}
+
+	opts := loadOptions(options...)
 
 	if expiry := opts.ExpiryDuration; expiry < 0 {
 		return nil, ErrInvalidPoolExpiry
@@ -131,122 +130,114 @@ func NewPool(size int, options ...Option) (*Pool, error) {
 		opts.Logger = defaultLogger
 	}
 
-	p := &Pool{
+	p := &PoolWithFunc{
 		capacity: int32(size),
+		poolFunc: pf,
 		lock:     internal.NewSpinLock(),
 		options:  opts,
 	}
-	/**
-	* &ants.Pool{capacity:2147483647, running:0, workers:ants.workerArray(nil), state:0, lock:(*internal.spinLock)(0xc0000b4004), cond:(*sync.Cond)(nil), workerCache:sync.Pool{noCopy:sync.noCopy{}, local:(unsafe.Pointer)(nil), localSize:0x0, victim:(unsafe.Pointer)(nil), victimSize:0x0, New:(func() interface {})(nil)}, blockingNum:0, options:(*ants.Options)(0xc0000b2040)}
-	*/
 	p.workerCache.New = func() interface{} {
-		return &goWorker{
+		return &goWorkerWithFunc{
 			pool: p,
-			task: make(chan func(), workerChanCap),
+			args: make(chan interface{}, workerChanCap),
 		}
 	}
-	//如果进行内存分配，如果不指定 会创建最大的内存分配
 	if p.options.PreAlloc {
-		if size == -1 {
-			return nil, ErrInvalidPreAllocSize
-		}
-		p.workers = newWorkerArray(loopQueueType, size)
-	} else {
-		p.workers = newWorkerArray(stackType, 0)
+		p.workers = make([]*goWorkerWithFunc, 0, size)
 	}
-
 	p.cond = sync.NewCond(p.lock)
 
 	// Start a goroutine to clean up expired workers periodically.
-	/**
-	* 开启一个协程进行 协程的清理工作
-	*/
 	go p.purgePeriodically()
 
 	return p, nil
 }
 
-// ---------------------------------------------------------------------------
+//---------------------------------------------------------------------------
 
-// Submit submits a task to this pool.
-func (p *Pool) Submit(task func()) error {
+// Invoke submits a task to pool.
+func (p *PoolWithFunc) Invoke(args interface{}) error {
 	if atomic.LoadInt32(&p.state) == CLOSED {
 		return ErrPoolClosed
 	}
-	var w *goWorker
+	var w *goWorkerWithFunc
 	if w = p.retrieveWorker(); w == nil {
 		return ErrPoolOverload
 	}
-	w.task <- task
+	w.args <- args
 	return nil
 }
 
 // Running returns the number of the currently running goroutines.
-func (p *Pool) Running() int {
+func (p *PoolWithFunc) Running() int {
 	return int(atomic.LoadInt32(&p.running))
 }
 
-// Free returns the available goroutines to work.
-func (p *Pool) Free() int {
+// Free returns a available goroutines to work.
+func (p *PoolWithFunc) Free() int {
 	return p.Cap() - p.Running()
 }
 
 // Cap returns the capacity of this pool.
-func (p *Pool) Cap() int {
+func (p *PoolWithFunc) Cap() int {
 	return int(atomic.LoadInt32(&p.capacity))
 }
 
-// Tune changes the capacity of this pool, this method is noneffective to the infinite pool.
-func (p *Pool) Tune(size int) {
-	if capacity := p.Cap(); capacity == -1 || size <= 0 || size == capacity || p.options.PreAlloc {
+// Tune changes the capacity of this pool.
+func (p *PoolWithFunc) Tune(size int) {
+	if size <= 0 || size == p.Cap() || p.options.PreAlloc {
 		return
 	}
 	atomic.StoreInt32(&p.capacity, int32(size))
 }
 
 // Release Closes this pool.
-func (p *Pool) Release() {
+func (p *PoolWithFunc) Release() {
 	atomic.StoreInt32(&p.state, CLOSED)
 	p.lock.Lock()
-	p.workers.reset()
+	idleWorkers := p.workers
+	for _, w := range idleWorkers {
+		w.args <- nil
+	}
+	p.workers = nil
 	p.lock.Unlock()
 }
 
 // Reboot reboots a released pool.
-func (p *Pool) Reboot() {
+func (p *PoolWithFunc) Reboot() {
 	if atomic.CompareAndSwapInt32(&p.state, CLOSED, OPENED) {
 		go p.purgePeriodically()
 	}
 }
 
-// ---------------------------------------------------------------------------
+//---------------------------------------------------------------------------
 
 // incRunning increases the number of the currently running goroutines.
-func (p *Pool) incRunning() {
+func (p *PoolWithFunc) incRunning() {
 	atomic.AddInt32(&p.running, 1)
 }
 
 // decRunning decreases the number of the currently running goroutines.
-func (p *Pool) decRunning() {
+func (p *PoolWithFunc) decRunning() {
 	atomic.AddInt32(&p.running, -1)
 }
 
 // retrieveWorker returns a available worker to run the tasks.
-func (p *Pool) retrieveWorker() (w *goWorker) {
+func (p *PoolWithFunc) retrieveWorker() (w *goWorkerWithFunc) {
 	spawnWorker := func() {
-		w = p.workerCache.Get().(*goWorker)
+		w = p.workerCache.Get().(*goWorkerWithFunc)
 		w.run()
 	}
 
 	p.lock.Lock()
-
-	w = p.workers.detach()
-	if w != nil {
+	idleWorkers := p.workers
+	n := len(idleWorkers) - 1
+	if n >= 0 {
+		w = idleWorkers[n]
+		idleWorkers[n] = nil
+		p.workers = idleWorkers[:n]
 		p.lock.Unlock()
-	} else if capacity := p.Cap(); capacity == -1 {
-		p.lock.Unlock()
-		spawnWorker()
-	} else if p.Running() < capacity {
+	} else if p.Running() < p.Cap() {
 		p.lock.Unlock()
 		spawnWorker()
 	} else {
@@ -267,30 +258,26 @@ func (p *Pool) retrieveWorker() (w *goWorker) {
 			spawnWorker()
 			return
 		}
-
-		w = p.workers.detach()
-		if w == nil {
+		l := len(p.workers) - 1
+		if l < 0 {
 			goto Reentry
 		}
-
+		w = p.workers[l]
+		p.workers[l] = nil
+		p.workers = p.workers[:l]
 		p.lock.Unlock()
 	}
 	return
 }
 
 // revertWorker puts a worker back into free pool, recycling the goroutines.
-func (p *Pool) revertWorker(worker *goWorker) bool {
-	if capacity := p.Cap(); (capacity > 0 && p.Running() > capacity) || atomic.LoadInt32(&p.state) == CLOSED {
+func (p *PoolWithFunc) revertWorker(worker *goWorkerWithFunc) bool {
+	if atomic.LoadInt32(&p.state) == CLOSED || p.Running() > p.Cap() {
 		return false
 	}
 	worker.recycleTime = time.Now()
 	p.lock.Lock()
-
-	err := p.workers.insert(worker)
-	if err != nil {
-		p.lock.Unlock()
-		return false
-	}
+	p.workers = append(p.workers, worker)
 
 	// Notify the invoker stuck in 'retrieveWorker()' of there is an available worker in the worker queue.
 	p.cond.Signal()
